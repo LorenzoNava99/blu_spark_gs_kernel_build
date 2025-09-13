@@ -1,0 +1,189 @@
+name: Build blu_spark Kernel (gs-next with KSU-Next+SUSFS)
+
+on:
+  push:
+    branches: [ main, blu_spark-16 ]
+  pull_request:
+    branches: [ main, blu_spark-16 ]
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: 'Kernel variant to build'
+        required: true
+        default: 'gs-next'
+        type: choice
+        options:
+        - gs-next
+        - gs-debug
+        - all
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        include:
+          - name: "blu_spark gs-next (KSU-Next + SUSFS)"
+            config: "blu_spark_defconfig"
+            arch: "arm64"
+            cross_compile: "aarch64-linux-gnu-"
+            target: "Image.lz4"
+            output_name: "blu_spark_gs-next_ksu_susfs"
+
+    steps:
+    - name: Checkout kernel source
+      uses: actions/checkout@v4
+
+    - name: Set up build environment
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          libc6-dev \
+          binutils \
+          gcc-aarch64-linux-gnu \
+          python3 \
+          python3-pip \
+          git \
+          wget \
+          curl \
+          lz4 \
+          ccache
+
+        # Set up ccache for faster builds
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
+
+    - name: Install LLVM/Clang toolchain
+      run: |
+        wget https://apt.llvm.org/llvm.sh
+        chmod +x llvm.sh
+        sudo ./llvm.sh 17
+        sudo apt-get install -y clang-17 lld-17
+
+        # Set up LLVM environment
+        sudo ln -sf /usr/bin/clang-17 /usr/bin/clang
+        sudo ln -sf /usr/bin/ld.lld-17 /usr/bin/ld.lld
+
+    - name: Verify build environment
+      run: |
+        echo "=== Build Environment ==="
+        gcc --version
+        clang --version
+        ld.lld --version
+        aarch64-linux-gnu-gcc --version
+        python3 --version
+        make --version
+        echo "========================="
+
+    - name: Configure ccache
+      run: |
+        ccache --max-size=2G
+        ccache --set-config=compression=true
+        ccache --zero-stats
+
+    - name: Build kernel - ${{ matrix.name }}
+      run: |
+        echo "=== Building ${{ matrix.name }} ==="
+        echo "Config: ${{ matrix.config }}"
+        echo "Architecture: ${{ matrix.arch }}"
+        echo "Target: ${{ matrix.target }}"
+
+        # Configure kernel
+        make ARCH=${{ matrix.arch }} LLVM=1 ${{ matrix.config }}
+
+        # Show configuration
+        echo "=== KSU & SUSFS Configuration ==="
+        grep -E "CONFIG_KSU|SUSFS" .config || echo "No KSU/SUSFS config found"
+
+        # Build kernel
+        make ARCH=${{ matrix.arch }} LLVM=1 \
+          CROSS_COMPILE=${{ matrix.cross_compile }} \
+          -j$(nproc) \
+          ${{ matrix.target }}
+
+        # Build additional targets
+        make ARCH=${{ matrix.arch }} LLVM=1 \
+          CROSS_COMPILE=${{ matrix.cross_compile }} \
+          -j$(nproc) \
+          Image Image.gz modules
+
+    - name: Create boot image (Android format)
+      run: |
+        echo "=== Creating Android Boot Image ==="
+
+        # Install mkbootimg tool
+        pip3 install mkbootimg
+
+        # Create boot.img compatible with Android fastboot
+        mkdir -p output
+
+        # Copy kernel images
+        cp arch/${{ matrix.arch }}/boot/Image output/
+        cp arch/${{ matrix.arch }}/boot/Image.gz output/
+        if [ -f arch/${{ matrix.arch }}/boot/Image.lz4 ]; then
+          cp arch/${{ matrix.arch }}/boot/Image.lz4 output/
+        fi
+
+        # Create Android boot image
+        python3 -m mkbootimg \
+          --kernel arch/${{ matrix.arch }}/boot/Image.lz4 \
+          --header_version 4 \
+          --os_version 15.0.0 \
+          --os_patch_level 2025-09 \
+          --output output/${{ matrix.output_name }}.img
+
+        # Create info file
+        cat > output/build-info.txt << EOF
+        Kernel: blu_spark gs-next
+        Features: KSU-Next v1881 + SUSFS
+        Architecture: ${{ matrix.arch }}
+        Config: ${{ matrix.config }}
+        Android: 15/16 ASB 2025-09
+        Build Date: $(date -u)
+        Git Commit: ${GITHUB_SHA}
+        EOF
+
+        # Show file sizes
+        echo "=== Generated Files ==="
+        ls -lah output/
+
+    - name: Verify SUSFS integration
+      run: |
+        echo "=== Verifying SUSFS Integration ==="
+        if command -v strings >/dev/null 2>&1; then
+          if strings arch/${{ matrix.arch }}/boot/Image.lz4 | grep -i susfs; then
+            echo "✅ SUSFS strings found in kernel image"
+          else
+            echo "❌ SUSFS strings not found"
+            exit 1
+          fi
+
+          if strings arch/${{ matrix.arch }}/boot/Image.lz4 | grep "CONFIG_KSU"; then
+            echo "✅ KSU configuration found in kernel image"
+          else
+            echo "❌ KSU configuration not found"
+            exit 1
+          fi
+        fi
+
+    - name: Upload kernel artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.output_name }}-${{ github.run_number }}
+        path: |
+          output/${{ matrix.output_name }}.img
+          output/Image*
+          output/build-info.txt
+          arch/${{ matrix.arch }}/boot/Image*
+          .config
+        retention-days: 30
+
+    - name: Show ccache stats
+      run: |
+        echo "=== ccache Statistics ==="
+        ccache --show-stats
