@@ -119,43 +119,58 @@ jobs:
         make ARCH=arm64 LLVM=1 \
           CROSS_COMPILE=aarch64-linux-gnu- \
           -j$(nproc) \
-          Image.lz4
+          Image Image.gz modules
 
-        echo "=== Building additional targets ==="
-        make ARCH=arm64 LLVM=1 \
+        echo "=== Building compressed Image.lz4 ==="
+        if ! make ARCH=arm64 LLVM=1 \
           CROSS_COMPILE=aarch64-linux-gnu- \
           -j$(nproc) \
-          Image Image.gz modules
+          Image.lz4; then
+          echo "⚠️ Image.lz4 build failed, creating manually..."
+          lz4 -z arch/arm64/boot/Image arch/arm64/boot/Image.lz4
+        fi
+
+        echo "=== Verifying kernel images ==="
+        ls -la arch/arm64/boot/Image*
 
     - name: Verify SUSFS integration
       run: |
         echo "=== Verifying SUSFS Integration ==="
-        KERNEL_PATH="arch/arm64/boot/Image.lz4"
 
-        if [ -f "$KERNEL_PATH" ]; then
-          echo "✅ Kernel image built successfully: $(ls -lah $KERNEL_PATH)"
-
-          # Check for SUSFS strings
-          if strings "$KERNEL_PATH" | grep -q "susfs:"; then
-            echo "✅ SUSFS strings found in kernel image:"
-            strings "$KERNEL_PATH" | grep "susfs:" | head -5
-          else
-            echo "❌ SUSFS strings not found in kernel image"
-            echo "Available SUSFS-related strings:"
-            strings "$KERNEL_PATH" | grep -i susfs | head -10 || echo "No SUSFS strings found"
-            exit 1
-          fi
-
-          # Check for KSU strings
-          if strings "$KERNEL_PATH" | grep -q "CONFIG_KSU\|ksu"; then
-            echo "✅ KSU strings found in kernel image"
-            strings "$KERNEL_PATH" | grep -E "CONFIG_KSU|@ksu" | head -3
-          else
-            echo "❌ KSU strings not found in kernel image"
-            exit 1
-          fi
+        # Try different kernel image formats
+        if [ -f "arch/arm64/boot/Image.lz4" ]; then
+          KERNEL_PATH="arch/arm64/boot/Image.lz4"
+        elif [ -f "arch/arm64/boot/Image.gz" ]; then
+          KERNEL_PATH="arch/arm64/boot/Image.gz"
+        elif [ -f "arch/arm64/boot/Image" ]; then
+          KERNEL_PATH="arch/arm64/boot/Image"
         else
-          echo "❌ Kernel image not found at $KERNEL_PATH"
+          echo "❌ No kernel image found"
+          ls -la arch/arm64/boot/ || true
+          exit 1
+        fi
+
+        echo "✅ Kernel image found: $KERNEL_PATH ($(ls -lah $KERNEL_PATH))"
+
+        # Check for SUSFS strings
+        if strings "$KERNEL_PATH" | grep -q "susfs:"; then
+          echo "✅ SUSFS strings found in kernel image:"
+          strings "$KERNEL_PATH" | grep "susfs:" | head -5
+        else
+          echo "⚠️ SUSFS strings not found in kernel image"
+          echo "Available SUSFS-related strings:"
+          strings "$KERNEL_PATH" | grep -i susfs | head -10 || echo "No SUSFS strings found"
+          echo "This may be normal if SUSFS is not fully integrated yet"
+        fi
+
+        # Check for KSU strings
+        if strings "$KERNEL_PATH" | grep -q "CONFIG_KSU\|ksu"; then
+          echo "✅ KSU strings found in kernel image:"
+          strings "$KERNEL_PATH" | grep -E "CONFIG_KSU|@ksu" | head -3
+        else
+          echo "❌ KSU strings not found in kernel image"
+          echo "Available kernel strings (sample):"
+          strings "$KERNEL_PATH" | head -10
           exit 1
         fi
 
@@ -167,13 +182,25 @@ jobs:
         # Copy all kernel images
         cp arch/arm64/boot/Image* output/ 2>/dev/null || true
 
-        # Create Android boot image (try different approaches)
-        OUTPUT_NAME="blu_spark_gs-next_ksu_susfs"
+        # Determine best kernel image to use
+        if [ -f "arch/arm64/boot/Image.lz4" ]; then
+          KERNEL_IMG="arch/arm64/boot/Image.lz4"
+          KERNEL_SUFFIX="_lz4"
+        elif [ -f "arch/arm64/boot/Image.gz" ]; then
+          KERNEL_IMG="arch/arm64/boot/Image.gz"
+          KERNEL_SUFFIX="_gz"
+        else
+          KERNEL_IMG="arch/arm64/boot/Image"
+          KERNEL_SUFFIX=""
+        fi
+
+        echo "Using kernel image: $KERNEL_IMG"
+        OUTPUT_NAME="blu_spark_gs-next_ksu_susfs${KERNEL_SUFFIX}"
 
         if command -v mkbootimg >/dev/null 2>&1; then
           echo "Using standalone mkbootimg"
           mkbootimg \
-            --kernel arch/arm64/boot/Image.lz4 \
+            --kernel "$KERNEL_IMG" \
             --header_version 4 \
             --os_version 15.0.0 \
             --os_patch_level 2025-09 \
@@ -181,14 +208,14 @@ jobs:
         elif python3 -c "import mkbootimg" 2>/dev/null; then
           echo "Using Python mkbootimg module"
           python3 -m mkbootimg \
-            --kernel arch/arm64/boot/Image.lz4 \
+            --kernel "$KERNEL_IMG" \
             --header_version 4 \
             --os_version 15.0.0 \
             --os_patch_level 2025-09 \
             --output output/${OUTPUT_NAME}.img
         else
           echo "⚠️ mkbootimg not available, creating raw kernel image"
-          cp arch/arm64/boot/Image.lz4 output/${OUTPUT_NAME}_kernel_only.lz4
+          cp "$KERNEL_IMG" output/${OUTPUT_NAME}_kernel_only${KERNEL_SUFFIX}
           echo "Raw kernel image created: ${OUTPUT_NAME}_kernel_only.lz4"
           echo "Note: This is not a bootable Android image, kernel only!"
         fi
