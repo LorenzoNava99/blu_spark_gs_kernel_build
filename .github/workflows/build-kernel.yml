@@ -70,9 +70,13 @@ jobs:
         sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-18 100
         sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-18 100
 
-    - name: Install mkbootimg
+    - name: Install Android tools
       run: |
-        pip3 install mkbootimg
+        # Try multiple sources for mkbootimg
+        pip3 install git+https://android.googlesource.com/platform/system/tools/mkbootimg || \
+        (wget -q https://github.com/osm0sis/mkbootimg/raw/master/mkbootimg.py -O /usr/local/bin/mkbootimg && \
+         chmod +x /usr/local/bin/mkbootimg) || \
+        echo "Warning: mkbootimg not available, will create raw kernel image only"
 
     - name: Verify build environment
       run: |
@@ -163,14 +167,31 @@ jobs:
         # Copy all kernel images
         cp arch/arm64/boot/Image* output/ 2>/dev/null || true
 
-        # Create Android boot image
+        # Create Android boot image (try different approaches)
         OUTPUT_NAME="blu_spark_gs-next_ksu_susfs"
-        python3 -m mkbootimg \
-          --kernel arch/arm64/boot/Image.lz4 \
-          --header_version 4 \
-          --os_version 15.0.0 \
-          --os_patch_level 2025-09 \
-          --output output/${OUTPUT_NAME}.img
+
+        if command -v mkbootimg >/dev/null 2>&1; then
+          echo "Using standalone mkbootimg"
+          mkbootimg \
+            --kernel arch/arm64/boot/Image.lz4 \
+            --header_version 4 \
+            --os_version 15.0.0 \
+            --os_patch_level 2025-09 \
+            --output output/${OUTPUT_NAME}.img
+        elif python3 -c "import mkbootimg" 2>/dev/null; then
+          echo "Using Python mkbootimg module"
+          python3 -m mkbootimg \
+            --kernel arch/arm64/boot/Image.lz4 \
+            --header_version 4 \
+            --os_version 15.0.0 \
+            --os_patch_level 2025-09 \
+            --output output/${OUTPUT_NAME}.img
+        else
+          echo "⚠️ mkbootimg not available, creating raw kernel image"
+          cp arch/arm64/boot/Image.lz4 output/${OUTPUT_NAME}_kernel_only.lz4
+          echo "Raw kernel image created: ${OUTPUT_NAME}_kernel_only.lz4"
+          echo "Note: This is not a bootable Android image, kernel only!"
+        fi
 
         # Create build info
         cat > output/build-info.txt << EOF
