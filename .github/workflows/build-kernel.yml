@@ -7,32 +7,29 @@ on:
     branches: [ main, blu_spark-16 ]
   workflow_dispatch:
     inputs:
-      variant:
-        description: 'Kernel variant to build'
-        required: true
-        default: 'gs-next'
-        type: choice
-        options:
-        - gs-next
-        - gs-debug
-        - all
+      clean_build:
+        description: 'Clean build (mrproper)'
+        required: false
+        default: 'true'
+        type: boolean
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        include:
-          - name: "blu_spark gs-next (KSU-Next + SUSFS)"
-            config: "blu_spark_defconfig"
-            arch: "arm64"
-            cross_compile: "aarch64-linux-gnu-"
-            target: "Image.lz4"
-            output_name: "blu_spark_gs-next_ksu_susfs"
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout kernel source
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf "/usr/local/share/boost"
+        sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+        df -h
 
     - name: Set up build environment
       run: |
@@ -53,29 +50,39 @@ jobs:
           wget \
           curl \
           lz4 \
-          ccache
+          ccache \
+          cpio \
+          kmod
 
-        # Set up ccache for faster builds
-        echo "/usr/lib/ccache" >> $GITHUB_PATH
-
-    - name: Install LLVM/Clang toolchain
+    - name: Install LLVM/Clang 18
       run: |
         wget https://apt.llvm.org/llvm.sh
         chmod +x llvm.sh
-        sudo ./llvm.sh 17
-        sudo apt-get install -y clang-17 lld-17
+        sudo ./llvm.sh 18
+        sudo apt-get install -y clang-18 lld-18 llvm-18
 
-        # Set up LLVM environment
-        sudo ln -sf /usr/bin/clang-17 /usr/bin/clang
-        sudo ln -sf /usr/bin/ld.lld-17 /usr/bin/ld.lld
+        # Set up LLVM symlinks
+        sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-18 100
+        sudo update-alternatives --install /usr/bin/ld.lld ld.lld /usr/bin/ld.lld-18 100
+        sudo update-alternatives --install /usr/bin/llvm-ar llvm-ar /usr/bin/llvm-ar-18 100
+        sudo update-alternatives --install /usr/bin/llvm-nm llvm-nm /usr/bin/llvm-nm-18 100
+        sudo update-alternatives --install /usr/bin/llvm-objcopy llvm-objcopy /usr/bin/llvm-objcopy-18 100
+        sudo update-alternatives --install /usr/bin/llvm-objdump llvm-objdump /usr/bin/llvm-objdump-18 100
+        sudo update-alternatives --install /usr/bin/llvm-strip llvm-strip /usr/bin/llvm-strip-18 100
+
+    - name: Install mkbootimg
+      run: |
+        pip3 install mkbootimg
 
     - name: Verify build environment
       run: |
         echo "=== Build Environment ==="
         gcc --version
+        aarch64-linux-gnu-gcc --version
         clang --version
         ld.lld --version
-        aarch64-linux-gnu-gcc --version
+        llvm-ar --version
+        llvm-nm --version
         python3 --version
         make --version
         echo "========================="
@@ -85,101 +92,141 @@ jobs:
         ccache --max-size=2G
         ccache --set-config=compression=true
         ccache --zero-stats
+        echo "/usr/lib/ccache" >> $GITHUB_PATH
 
-    - name: Build kernel - ${{ matrix.name }}
+    - name: Clean build environment
       run: |
-        echo "=== Building ${{ matrix.name }} ==="
-        echo "Config: ${{ matrix.config }}"
-        echo "Architecture: ${{ matrix.arch }}"
-        echo "Target: ${{ matrix.target }}"
-
-        # Configure kernel
-        make ARCH=${{ matrix.arch }} LLVM=1 ${{ matrix.config }}
-
-        # Show configuration
-        echo "=== KSU & SUSFS Configuration ==="
-        grep -E "CONFIG_KSU|SUSFS" .config || echo "No KSU/SUSFS config found"
-
-        # Build kernel
-        make ARCH=${{ matrix.arch }} LLVM=1 \
-          CROSS_COMPILE=${{ matrix.cross_compile }} \
-          -j$(nproc) \
-          ${{ matrix.target }}
-
-        # Build additional targets
-        make ARCH=${{ matrix.arch }} LLVM=1 \
-          CROSS_COMPILE=${{ matrix.cross_compile }} \
-          -j$(nproc) \
-          Image Image.gz modules
-
-    - name: Create boot image (Android format)
-      run: |
-        echo "=== Creating Android Boot Image ==="
-
-        # Install mkbootimg tool
-        pip3 install mkbootimg
-
-        # Create boot.img compatible with Android fastboot
-        mkdir -p output
-
-        # Copy kernel images
-        cp arch/${{ matrix.arch }}/boot/Image output/
-        cp arch/${{ matrix.arch }}/boot/Image.gz output/
-        if [ -f arch/${{ matrix.arch }}/boot/Image.lz4 ]; then
-          cp arch/${{ matrix.arch }}/boot/Image.lz4 output/
+        if [ "${{ inputs.clean_build }}" = "true" ] || [ "${{ github.event_name }}" = "push" ]; then
+          echo "=== Performing clean build ==="
+          make ARCH=arm64 mrproper
         fi
 
-        # Create Android boot image
-        python3 -m mkbootimg \
-          --kernel arch/${{ matrix.arch }}/boot/Image.lz4 \
-          --header_version 4 \
-          --os_version 15.0.0 \
-          --os_patch_level 2025-09 \
-          --output output/${{ matrix.output_name }}.img
+    - name: Configure kernel
+      run: |
+        echo "=== Configuring kernel ==="
+        make ARCH=arm64 LLVM=1 blu_spark_defconfig
 
-        # Create info file
-        cat > output/build-info.txt << EOF
-        Kernel: blu_spark gs-next
-        Features: KSU-Next v1881 + SUSFS
-        Architecture: ${{ matrix.arch }}
-        Config: ${{ matrix.config }}
-        Android: 15/16 ASB 2025-09
-        Build Date: $(date -u)
-        Git Commit: ${GITHUB_SHA}
-        EOF
+        echo "=== Verifying SUSFS configuration ==="
+        grep -E "CONFIG_KSU|SUSFS" .config || echo "Warning: No KSU/SUSFS config found"
 
-        # Show file sizes
-        echo "=== Generated Files ==="
-        ls -lah output/
+    - name: Build kernel
+      run: |
+        echo "=== Building kernel ==="
+        make ARCH=arm64 LLVM=1 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          -j$(nproc) \
+          Image.lz4
+
+        echo "=== Building additional targets ==="
+        make ARCH=arm64 LLVM=1 \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          -j$(nproc) \
+          Image Image.gz modules
 
     - name: Verify SUSFS integration
       run: |
         echo "=== Verifying SUSFS Integration ==="
-        if command -v strings >/dev/null 2>&1; then
-          if strings arch/${{ matrix.arch }}/boot/Image.lz4 | grep -i susfs; then
-            echo "✅ SUSFS strings found in kernel image"
+        KERNEL_PATH="arch/arm64/boot/Image.lz4"
+
+        if [ -f "$KERNEL_PATH" ]; then
+          echo "✅ Kernel image built successfully: $(ls -lah $KERNEL_PATH)"
+
+          # Check for SUSFS strings
+          if strings "$KERNEL_PATH" | grep -q "susfs:"; then
+            echo "✅ SUSFS strings found in kernel image:"
+            strings "$KERNEL_PATH" | grep "susfs:" | head -5
           else
-            echo "❌ SUSFS strings not found"
+            echo "❌ SUSFS strings not found in kernel image"
+            echo "Available SUSFS-related strings:"
+            strings "$KERNEL_PATH" | grep -i susfs | head -10 || echo "No SUSFS strings found"
             exit 1
           fi
 
-          if strings arch/${{ matrix.arch }}/boot/Image.lz4 | grep "CONFIG_KSU"; then
-            echo "✅ KSU configuration found in kernel image"
+          # Check for KSU strings
+          if strings "$KERNEL_PATH" | grep -q "CONFIG_KSU\|ksu"; then
+            echo "✅ KSU strings found in kernel image"
+            strings "$KERNEL_PATH" | grep -E "CONFIG_KSU|@ksu" | head -3
           else
-            echo "❌ KSU configuration not found"
+            echo "❌ KSU strings not found in kernel image"
             exit 1
           fi
+        else
+          echo "❌ Kernel image not found at $KERNEL_PATH"
+          exit 1
         fi
 
-    - name: Upload kernel artifacts
+    - name: Create boot image
+      run: |
+        echo "=== Creating Android Boot Image ==="
+        mkdir -p output
+
+        # Copy all kernel images
+        cp arch/arm64/boot/Image* output/ 2>/dev/null || true
+
+        # Create Android boot image
+        OUTPUT_NAME="blu_spark_gs-next_ksu_susfs"
+        python3 -m mkbootimg \
+          --kernel arch/arm64/boot/Image.lz4 \
+          --header_version 4 \
+          --os_version 15.0.0 \
+          --os_patch_level 2025-09 \
+          --output output/${OUTPUT_NAME}.img
+
+        # Create build info
+        cat > output/build-info.txt << EOF
+        Kernel: blu_spark gs-next
+        Features: KSU-Next v12081 + SUSFS
+        Architecture: arm64
+        Config: blu_spark_defconfig
+        Android: 15/16 ASB 2025-09
+        Build Date: $(date -u)
+        Git Commit: ${GITHUB_SHA}
+        Kernel Size: $(stat -c%s arch/arm64/boot/Image.lz4) bytes
+        Boot Image Size: $(stat -c%s output/${OUTPUT_NAME}.img) bytes
+        EOF
+
+        echo "=== Build Results ==="
+        ls -lah output/
+        echo ""
+        echo "=== Boot Image Info ==="
+        file output/${OUTPUT_NAME}.img
+
+    - name: Final verification
+      run: |
+        echo "=== Final Verification ==="
+        BOOT_IMG="output/blu_spark_gs-next_ksu_susfs.img"
+
+        if [ -f "$BOOT_IMG" ]; then
+          SIZE=$(stat -c%s "$BOOT_IMG")
+          echo "✅ Boot image created: $SIZE bytes ($(($SIZE / 1024 / 1024))MB)"
+
+          # Verify it's an Android boot image
+          if file "$BOOT_IMG" | grep -q "Android"; then
+            echo "✅ Valid Android boot image format"
+          else
+            echo "⚠️  Boot image format verification inconclusive"
+          fi
+
+          # Check if size is reasonable (should be 40-80MB for this kernel)
+          if [ "$SIZE" -gt 20000000 ] && [ "$SIZE" -lt 100000000 ]; then
+            echo "✅ Boot image size is reasonable"
+          else
+            echo "⚠️  Boot image size seems unusual: ${SIZE} bytes"
+          fi
+        else
+          echo "❌ Boot image not found"
+          exit 1
+        fi
+
+    - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: ${{ matrix.output_name }}-${{ github.run_number }}
+        name: blu_spark-gs-next-ksu-susfs-${{ github.run_number }}
         path: |
-          output/${{ matrix.output_name }}.img
+          output/blu_spark_gs-next_ksu_susfs.img
           output/Image*
           output/build-info.txt
-          arch/${{ matrix.arch }}/boot/Image*
+          arch/arm64/boot/Image*
           .config
         retention-days: 30
 
