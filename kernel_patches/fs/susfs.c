@@ -14,6 +14,7 @@
 #include <linux/version.h>
 #include <linux/fdtable.h>
 #include <linux/mnt_namespace.h>
+#include <linux/mm.h>
 #include "internal.h"
 #include "mount.h"
 #include <linux/susfs.h>
@@ -40,6 +41,25 @@ bool is_log_enable = true;
 #define SUSFS_LOGI(fmt, ...) 
 #define SUSFS_LOGE(fmt, ...) 
 #endif
+
+/* VMA iterator helpers for Linux 6.1+ Maple Tree compatibility */
+static inline struct vm_area_struct *susfs_get_next_vma(struct vm_area_struct *vma)
+{
+	struct vma_iterator vmi;
+	if (!vma || !vma->vm_mm)
+		return NULL;
+	vma_iter_init(&vmi, vma->vm_mm, vma->vm_end);
+	return vma_next(&vmi);
+}
+
+static inline struct vm_area_struct *susfs_get_prev_vma(struct vm_area_struct *vma)
+{
+	struct vma_iterator vmi;
+	if (!vma || !vma->vm_mm || vma->vm_start == 0)
+		return NULL;
+	vma_iter_init(&vmi, vma->vm_mm, vma->vm_start - 1);
+	return vma_prev(&vmi);
+}
 
 int susfs_add_sus_path(struct st_susfs_sus_path* __user user_info) {
 	struct st_susfs_sus_path_list *cursor, *temp;
@@ -816,40 +836,40 @@ int susfs_sus_maps(unsigned long target_ino, unsigned long target_addr_size, uns
 						((cursor->info.target_prot & VM_MAYSHARE) == (*flags & VM_MAYSHARE)) &&
 						  cursor->info.target_addr_size == target_addr_size &&
 						  cursor->info.target_pgoff == *pgoff) {
-						// if is NOT isolated_entry, check for vma->vm_next and vma->vm_prev to see if they have the same inode
+						// if is NOT isolated_entry, check for susfs_get_next_vma(vma) and susfs_get_prev_vma(vma) to see if they have the same inode
 						if (!cursor->info.is_isolated_entry) {
-							if (vma && vma->vm_next) {
-								if (vma->vm_next->vm_file) {
-									tmp_inode = file_inode(vma->vm_next->vm_file);
+							struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+							if (next_vma && next_vma->vm_file) {
+								tmp_inode = file_inode(next_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino)
 										goto do_spoof;
-								}
 							}
-							if (vma && vma->vm_prev) {
-								if (vma->vm_prev->vm_file) {
-									tmp_inode = file_inode(vma->vm_prev->vm_file);
+							}
+							struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+							if (prev_vma && prev_vma->vm_file) {
+								tmp_inode = file_inode(prev_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino)
 										goto do_spoof;
-								}
+							}
 							}
 							continue;
 						// if it is isolated_entry
 						} else {
-							if (vma && vma->vm_next) {
-								if (vma->vm_next->vm_file) {
-									tmp_inode = file_inode(vma->vm_next->vm_file);
+							struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+							if (next_vma && next_vma->vm_file) {
+								tmp_inode = file_inode(next_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino) {
 										continue;
-									}
 								}
 							}
-							if (vma && vma->vm_prev) {
-								if (vma->vm_prev->vm_file) {
-									tmp_inode = file_inode(vma->vm_prev->vm_file);
+							}
+							struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+							if (prev_vma && prev_vma->vm_file) {
+								tmp_inode = file_inode(prev_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino) {
 										continue;
-									}
 								}
+							}
 							}
 							// both prev and next don't have the same indoe as current entry, we can spoof now
 							goto do_spoof;
@@ -861,26 +881,29 @@ int susfs_sus_maps(unsigned long target_ino, unsigned long target_addr_size, uns
 					if (vma->vm_file) continue;
 					// compare next target ino only
 					if (cursor->info.prev_target_ino == 0 && cursor->info.next_target_ino > 0) {
-						if (vma->vm_next && vma->vm_next->vm_file) {
-							tmp_inode_next = file_inode(vma->vm_next->vm_file);
+						struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+						if (next_vma && next_vma->vm_file) {
+							tmp_inode_next = file_inode(next_vma->vm_file);
 							if (tmp_inode_next->i_ino == cursor->info.next_target_ino) {
 								goto do_spoof;
 							}
 						}
 					// compare prev target ino only
 					} else if (cursor->info.prev_target_ino > 0 && cursor->info.next_target_ino == 0) {
-						if (vma->vm_prev && vma->vm_prev->vm_file) {
-							tmp_inode_prev = file_inode(vma->vm_prev->vm_file);
+						struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+						if (prev_vma && prev_vma->vm_file) {
+							tmp_inode_prev = file_inode(prev_vma->vm_file);
 							if (tmp_inode_prev->i_ino == cursor->info.prev_target_ino) {
 								goto do_spoof;
 							}
 						}
 					// compare both prev ino and next ino
 					} else if (cursor->info.prev_target_ino > 0 && cursor->info.next_target_ino > 0) {
-						if (vma->vm_prev && vma->vm_prev->vm_file &&
-							vma->vm_next && vma->vm_next->vm_file) {
-							tmp_inode_prev = file_inode(vma->vm_prev->vm_file);
-							tmp_inode_next = file_inode(vma->vm_next->vm_file);
+						struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+						struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+						if (prev_vma && prev_vma->vm_file && next_vma && next_vma->vm_file) {
+							tmp_inode_prev = file_inode(prev_vma->vm_file);
+							tmp_inode_next = file_inode(next_vma->vm_file);
 							if (tmp_inode_prev->i_ino == cursor->info.prev_target_ino &&
 							    tmp_inode_next->i_ino == cursor->info.next_target_ino) {
 								goto do_spoof;
@@ -1020,40 +1043,40 @@ int susfs_sus_map_files_instantiate(struct vm_area_struct* vma) {
 						((cursor->info.target_prot & VM_MAYSHARE) == (target_flags & VM_MAYSHARE)) &&
 						  cursor->info.target_addr_size == target_addr_size &&
 						  cursor->info.target_pgoff == target_pgoff) {
-						// if is NOT isolated_entry, check for vma->vm_next and vma->vm_prev to see if they have the same inode
+						// if is NOT isolated_entry, check for susfs_get_next_vma(vma) and susfs_get_prev_vma(vma) to see if they have the same inode
 						if (!cursor->info.is_isolated_entry) {
-							if (vma && vma->vm_next) {
-								if (vma->vm_next->vm_file) {
-									tmp_inode = file_inode(vma->vm_next->vm_file);
+							struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+							if (next_vma && next_vma->vm_file) {
+								tmp_inode = file_inode(next_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino)
 										goto do_spoof;
-								}
 							}
-							if (vma && vma->vm_prev) {
-								if (vma->vm_prev->vm_file) {
-									tmp_inode = file_inode(vma->vm_prev->vm_file);
+							}
+							struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+							if (prev_vma && prev_vma->vm_file) {
+								tmp_inode = file_inode(prev_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino)
 										goto do_spoof;
-								}
+							}
 							}
 							continue;
 						// if it is isolated_entry
 						} else {
-							if (vma && vma->vm_next) {
-								if (vma->vm_next->vm_file) {
-									tmp_inode = file_inode(vma->vm_next->vm_file);
+							struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+							if (next_vma && next_vma->vm_file) {
+								tmp_inode = file_inode(next_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino) {
 										continue;
-									}
 								}
 							}
-							if (vma && vma->vm_prev) {
-								if (vma->vm_prev->vm_file) {
-									tmp_inode = file_inode(vma->vm_prev->vm_file);
+							}
+							struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+							if (prev_vma && prev_vma->vm_file) {
+								tmp_inode = file_inode(prev_vma->vm_file);
 									if (tmp_inode->i_ino == cursor->info.target_ino) {
 										continue;
-									}
 								}
+							}
 							}
 							// both prev and next don't have the same indoe as current entry, we can spoof now
 							goto do_spoof;
@@ -1065,26 +1088,29 @@ int susfs_sus_map_files_instantiate(struct vm_area_struct* vma) {
 					if (vma->vm_file) continue;
 					// compare next target ino only
 					if (cursor->info.prev_target_ino == 0 && cursor->info.next_target_ino > 0) {
-						if (vma->vm_next && vma->vm_next->vm_file) {
-							tmp_inode_next = file_inode(vma->vm_next->vm_file);
+						struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+						if (next_vma && next_vma->vm_file) {
+							tmp_inode_next = file_inode(next_vma->vm_file);
 							if (tmp_inode_next->i_ino == cursor->info.next_target_ino) {
 								goto do_spoof;
 							}
 						}
 					// compare prev target ino only
 					} else if (cursor->info.prev_target_ino > 0 && cursor->info.next_target_ino == 0) {
-						if (vma->vm_prev && vma->vm_prev->vm_file) {
-							tmp_inode_prev = file_inode(vma->vm_prev->vm_file);
+						struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+						if (prev_vma && prev_vma->vm_file) {
+							tmp_inode_prev = file_inode(prev_vma->vm_file);
 							if (tmp_inode_prev->i_ino == cursor->info.prev_target_ino) {
 								goto do_spoof;
 							}
 						}
 					// compare both prev ino and next ino
 					} else if (cursor->info.prev_target_ino > 0 && cursor->info.next_target_ino > 0) {
-						if (vma->vm_prev && vma->vm_prev->vm_file &&
-							vma->vm_next && vma->vm_next->vm_file) {
-							tmp_inode_prev = file_inode(vma->vm_prev->vm_file);
-							tmp_inode_next = file_inode(vma->vm_next->vm_file);
+						struct vm_area_struct *prev_vma = susfs_get_prev_vma(vma);
+						struct vm_area_struct *next_vma = susfs_get_next_vma(vma);
+						if (prev_vma && prev_vma->vm_file && next_vma && next_vma->vm_file) {
+							tmp_inode_prev = file_inode(prev_vma->vm_file);
+							tmp_inode_next = file_inode(next_vma->vm_file);
 							if (tmp_inode_prev->i_ino == cursor->info.prev_target_ino &&
 							    tmp_inode_next->i_ino == cursor->info.next_target_ino) {
 								goto do_spoof;
